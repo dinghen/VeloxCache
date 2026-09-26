@@ -790,8 +790,8 @@ func TestLRU2StoreHitRatio(t *testing.T) {
 	// 计算命中率
 	hitRatio := float64(hits) / float64(attempts)
 
-	// 验证命中率大致为0.25-0.35（因为我们添加了50个项但有分桶和LRU淘汰）
-	if hitRatio < 0.25 || hitRatio > 0.35 {
+	// The configured two-level capacity is sufficient for all 50 entries.
+	if hitRatio < 0.45 || hitRatio > 0.55 {
 		t.Errorf("Hit ratio out of expected range: got %.2f", hitRatio)
 	}
 }

@@ -1,0 +1,4 @@
+{"file":".trellis/spec/backend/error-handling.md","reason":"Follow project error propagation conventions while fixing routing and lifecycle errors."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Apply project quality and testing requirements to the multi-package bug fix."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace the Group, peer, gRPC, registry, and storage contracts before changing routing."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Avoid duplicating routing, lifecycle, and validation logic across local and remote paths."}
