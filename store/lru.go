@@ -18,6 +18,7 @@ type lruCache struct {
 	cleanupInterval time.Duration
 	cleanupTicker   *time.Ticker
 	closeCh         chan struct{} // 用于优雅关闭清理协程
+	closeOnce       sync.Once
 }
 
 // lruEntry 表示缓存中的一个条目
@@ -219,16 +220,18 @@ func (c *lruCache) cleanupLoop() {
 
 // Close 关闭缓存，停止清理协程
 func (c *lruCache) Close() {
-	if c.cleanupTicker != nil {
-		c.cleanupTicker.Stop()
+	c.closeOnce.Do(func() {
+		if c.cleanupTicker != nil {
+			c.cleanupTicker.Stop()
+		}
 		close(c.closeCh)
-	}
+	})
 }
 
 // GetWithExpiration 获取缓存项及其剩余过期时间
 func (c *lruCache) GetWithExpiration(key string) (Value, time.Duration, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	elem, ok := c.items[key]
 	if !ok {

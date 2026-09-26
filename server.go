@@ -29,6 +29,7 @@ type Server struct {
 	etcdCli    *clientv3.Client // etcd客户端
 	stopCh     chan error       // 停止信号
 	opts       *ServerOptions   // 服务器选项
+	stopOnce   sync.Once
 }
 
 // ServerOptions 服务器配置选项
@@ -76,9 +77,10 @@ func WithTLS(certFile, keyFile string) ServerOption {
 
 // NewServer 创建新的服务器实例
 func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
-	options := DefaultServerOptions
+	options := *DefaultServerOptions
+	options.EtcdEndpoints = append([]string(nil), DefaultServerOptions.EtcdEndpoints...)
 	for _, opt := range opts {
-		opt(options)
+		opt(&options)
 	}
 
 	// 创建etcd客户端
@@ -109,7 +111,7 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 		grpcServer: grpc.NewServer(serverOpts...),
 		etcdCli:    etcdCli,
 		stopCh:     make(chan error),
-		opts:       options,
+		opts:       &options,
 	}
 
 	// 注册服务
@@ -132,12 +134,12 @@ func (s *Server) Start() error {
 	}
 
 	// 注册到etcd
-	stopCh := make(chan error)
 	go func() {
-		if err := registry.Register(s.svcName, s.addr, stopCh); err != nil {
+		if err := registry.RegisterWithConfig(s.svcName, s.addr, s.stopCh, registry.Config{
+			Endpoints:   append([]string(nil), s.opts.EtcdEndpoints...),
+			DialTimeout: s.opts.DialTimeout,
+		}); err != nil {
 			logrus.Errorf("failed to register service: %v", err)
-			close(stopCh)
-			return
 		}
 	}()
 
@@ -147,11 +149,13 @@ func (s *Server) Start() error {
 
 // Stop 停止服务器
 func (s *Server) Stop() {
-	close(s.stopCh)
-	s.grpcServer.GracefulStop()
-	if s.etcdCli != nil {
-		s.etcdCli.Close()
-	}
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		s.grpcServer.GracefulStop()
+		if s.etcdCli != nil {
+			s.etcdCli.Close()
+		}
+	})
 }
 
 // Get 实现Cache服务的Get方法
@@ -161,7 +165,7 @@ func (s *Server) Get(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, 
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
 
-	view, err := group.Get(ctx, req.Key)
+	view, err := group.getLocal(ctx, req.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -176,13 +180,7 @@ func (s *Server) Set(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, 
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
 
-	// 从 context 中获取标记，如果没有则创建新的 context
-	fromPeer := ctx.Value("from_peer")
-	if fromPeer == nil {
-		ctx = context.WithValue(ctx, "from_peer", true)
-	}
-
-	if err := group.Set(ctx, req.Key, req.Value); err != nil {
+	if err := group.setLocal(req.Key, req.Value); err != nil {
 		return nil, err
 	}
 
@@ -196,7 +194,7 @@ func (s *Server) Delete(ctx context.Context, req *pb.Request) (*pb.ResponseForDe
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
 
-	err := group.Delete(ctx, req.Key)
+	err := group.deleteLocal(req.Key)
 	return &pb.ResponseForDelete{Value: err == nil}, err
 }
 

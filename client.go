@@ -3,6 +3,7 @@ package veloxcache
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -13,17 +14,21 @@ import (
 )
 
 type Client struct {
-	addr    string
-	svcName string
-	etcdCli *clientv3.Client
-	conn    *grpc.ClientConn
-	grpcCli pb.VeloxCacheClient
+	addr      string
+	svcName   string
+	etcdCli   *clientv3.Client
+	conn      *grpc.ClientConn
+	grpcCli   pb.VeloxCacheClient
+	ownsEtcd  bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
 var _ Peer = (*Client)(nil)
 
 func NewClient(addr string, svcName string, etcdCli *clientv3.Client) (*Client, error) {
 	var err error
+	ownsEtcd := false
 	if etcdCli == nil {
 		etcdCli, err = clientv3.New(clientv3.Config{
 			Endpoints:   []string{"localhost:2379"},
@@ -32,6 +37,7 @@ func NewClient(addr string, svcName string, etcdCli *clientv3.Client) (*Client, 
 		if err != nil {
 			return nil, fmt.Errorf("failed to create etcd client: %v", err)
 		}
+		ownsEtcd = true
 	}
 
 	conn, err := grpc.Dial(addr,
@@ -41,17 +47,21 @@ func NewClient(addr string, svcName string, etcdCli *clientv3.Client) (*Client, 
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 	if err != nil {
+		if ownsEtcd {
+			_ = etcdCli.Close()
+		}
 		return nil, fmt.Errorf("failed to dial server: %v", err)
 	}
 
 	grpcClient := pb.NewVeloxCacheClient(conn)
 
 	client := &Client{
-		addr:    addr,
-		svcName: svcName,
-		etcdCli: etcdCli,
-		conn:    conn,
-		grpcCli: grpcClient,
+		addr:     addr,
+		svcName:  svcName,
+		etcdCli:  etcdCli,
+		conn:     conn,
+		grpcCli:  grpcClient,
+		ownsEtcd: ownsEtcd,
 	}
 
 	return client, nil
@@ -102,8 +112,15 @@ func (c *Client) Set(ctx context.Context, group, key string, value []byte) error
 }
 
 func (c *Client) Close() error {
-	if c.conn != nil {
-		return c.conn.Close()
-	}
-	return nil
+	c.closeOnce.Do(func() {
+		if c.conn != nil {
+			c.closeErr = c.conn.Close()
+		}
+		if c.ownsEtcd && c.etcdCli != nil {
+			if err := c.etcdCli.Close(); c.closeErr == nil {
+				c.closeErr = err
+			}
+		}
+	})
+	return c.closeErr
 }

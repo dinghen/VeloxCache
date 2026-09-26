@@ -26,6 +26,8 @@ var ErrValueRequired = errors.New("value is required")
 // ErrGroupClosed 组已关闭错误
 var ErrGroupClosed = errors.New("cache group is closed")
 
+var ErrNoOwner = errors.New("no cache owner is available")
+
 // Getter 加载键值的回调函数接口
 type Getter interface {
 	Get(ctx context.Context, key string) ([]byte, error)
@@ -111,13 +113,15 @@ func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption)
 
 	// 注册到全局组映射
 	groupsMu.Lock()
-	defer groupsMu.Unlock()
-
-	if _, exists := groups[name]; exists {
+	previous := groups[name]
+	if previous != nil {
 		logrus.Warnf("Group with name %s already exists, will be replaced", name)
 	}
-
 	groups[name] = g
+	groupsMu.Unlock()
+	if previous != nil {
+		_ = previous.Close()
+	}
 	logrus.Infof("Created cache group [%s] with cacheBytes=%d, expiration=%v", name, cacheBytes, g.expiration)
 
 	return g
@@ -140,7 +144,34 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 	if key == "" {
 		return ByteView{}, ErrKeyRequired
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
+	if g.peers != nil {
+		peer, ok, self := g.peers.PickPeer(key)
+		if !ok {
+			return ByteView{}, ErrNoOwner
+		}
+		if !self {
+			value, err := peer.Get(g.name, key)
+			if err != nil {
+				return ByteView{}, fmt.Errorf("get from owner: %w", err)
+			}
+			return ByteView{b: cloneBytes(value)}, nil
+		}
+	}
+
+	return g.getLocal(ctx, key)
+}
+
+func (g *Group) getLocal(ctx context.Context, key string) (ByteView, error) {
+	if atomic.LoadInt32(&g.closed) == 1 {
+		return ByteView{}, ErrGroupClosed
+	}
+	if key == "" {
+		return ByteView{}, ErrKeyRequired
+	}
 	// 从本地缓存获取
 	view, ok := g.mainCache.Get(ctx, key)
 	if ok {
@@ -167,10 +198,32 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	if len(value) == 0 {
 		return ErrValueRequired
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	// 检查是否是从其他节点同步过来的请求
-	isPeerRequest := ctx.Value("from_peer") != nil
+	if g.peers != nil {
+		peer, ok, self := g.peers.PickPeer(key)
+		if !ok {
+			return ErrNoOwner
+		}
+		if !self {
+			return peer.Set(ctx, g.name, key, value)
+		}
+	}
+	return g.setLocal(key, value)
+}
 
+func (g *Group) setLocal(key string, value []byte) error {
+	if atomic.LoadInt32(&g.closed) == 1 {
+		return ErrGroupClosed
+	}
+	if key == "" {
+		return ErrKeyRequired
+	}
+	if len(value) == 0 {
+		return ErrValueRequired
+	}
 	// 创建缓存视图
 	view := ByteView{b: cloneBytes(value)}
 
@@ -179,11 +232,6 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 		g.mainCache.AddWithExpiration(key, view, time.Now().Add(g.expiration))
 	} else {
 		g.mainCache.Add(key, view)
-	}
-
-	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
-	if !isPeerRequest && g.peers != nil {
-		go g.syncToPeers(ctx, "set", key, value)
 	}
 
 	return nil
@@ -199,47 +247,33 @@ func (g *Group) Delete(ctx context.Context, key string) error {
 	if key == "" {
 		return ErrKeyRequired
 	}
-
-	// 从本地缓存删除
-	g.mainCache.Delete(key)
-
-	// 检查是否是从其他节点同步过来的请求
-	isPeerRequest := ctx.Value("from_peer") != nil
-
-	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
-	if !isPeerRequest && g.peers != nil {
-		go g.syncToPeers(ctx, "delete", key, nil)
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	return nil
+	if g.peers != nil {
+		peer, ok, self := g.peers.PickPeer(key)
+		if !ok {
+			return ErrNoOwner
+		}
+		if !self {
+			_, err := peer.Delete(g.name, key)
+			return err
+		}
+	}
+	return g.deleteLocal(key)
 }
 
-// syncToPeers 同步操作到其他节点
-func (g *Group) syncToPeers(ctx context.Context, op string, key string, value []byte) {
-	if g.peers == nil {
-		return
+func (g *Group) deleteLocal(key string) error {
+	if atomic.LoadInt32(&g.closed) == 1 {
+		return ErrGroupClosed
 	}
-
-	// 选择对等节点
-	peer, ok, isSelf := g.peers.PickPeer(key)
-	if !ok || isSelf {
-		return
+	if key == "" {
+		return ErrKeyRequired
 	}
-
-	// 创建同步请求上下文
-	syncCtx := context.WithValue(context.Background(), "from_peer", true)
-
-	var err error
-	switch op {
-	case "set":
-		err = peer.Set(syncCtx, g.name, key, value)
-	case "delete":
-		_, err = peer.Delete(g.name, key)
-	}
-
-	if err != nil {
-		logrus.Errorf("[VeloxCache] failed to sync %s to peer: %v", op, err)
-	}
+	// 从本地缓存删除
+	g.mainCache.Delete(key)
+	return nil
 }
 
 // Clear 清空缓存
@@ -267,7 +301,9 @@ func (g *Group) Close() error {
 
 	// 从全局组映射中移除
 	groupsMu.Lock()
-	delete(groups, g.name)
+	if groups[g.name] == g {
+		delete(groups, g.name)
+	}
 	groupsMu.Unlock()
 
 	logrus.Infof("[VeloxCache] closed cache group [%s]", g.name)
@@ -306,21 +342,6 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 
 // loadData 实际加载数据的方法
 func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err error) {
-	// 尝试从远程节点获取
-	if g.peers != nil {
-		peer, ok, isSelf := g.peers.PickPeer(key)
-		if ok && !isSelf {
-			value, err := g.getFromPeer(ctx, peer, key)
-			if err == nil {
-				atomic.AddInt64(&g.stats.peerHits, 1)
-				return value, nil
-			}
-
-			atomic.AddInt64(&g.stats.peerMisses, 1)
-			logrus.Warnf("[VeloxCache] failed to get from peer: %v", err)
-		}
-	}
-
 	// 从数据源加载
 	bytes, err := g.getter.Get(ctx, key)
 	if err != nil {
@@ -332,16 +353,11 @@ func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err e
 }
 
 // getFromPeer 从其他节点获取数据
-func (g *Group) getFromPeer(ctx context.Context, peer Peer, key string) (ByteView, error) {
-	bytes, err := peer.Get(g.name, key)
-	if err != nil {
-		return ByteView{}, fmt.Errorf("failed to get from peer: %w", err)
-	}
-	return ByteView{b: bytes}, nil
-}
-
 // RegisterPeers 注册PeerPicker
 func (g *Group) RegisterPeers(peers PeerPicker) {
+	if peers == nil {
+		return
+	}
 	if g.peers != nil {
 		panic("RegisterPeers called more than once")
 	}
@@ -402,26 +418,31 @@ func ListGroups() []string {
 // DestroyGroup 销毁指定名称的缓存组
 func DestroyGroup(name string) bool {
 	groupsMu.Lock()
-	defer groupsMu.Unlock()
-
-	if g, exists := groups[name]; exists {
-		g.Close()
+	g, exists := groups[name]
+	if exists {
 		delete(groups, name)
-		logrus.Infof("[VeloxCache] destroyed cache group [%s]", name)
-		return true
 	}
+	groupsMu.Unlock()
+	if !exists {
+		return false
+	}
+	g.Close()
+	logrus.Infof("[VeloxCache] destroyed cache group [%s]", name)
+	return true
 
-	return false
 }
 
 // DestroyAllGroups 销毁所有缓存组
 func DestroyAllGroups() {
 	groupsMu.Lock()
-	defer groupsMu.Unlock()
-
+	all := make(map[string]*Group, len(groups))
 	for name, g := range groups {
-		g.Close()
-		delete(groups, name)
+		all[name] = g
 		logrus.Infof("[VeloxCache] destroyed cache group [%s]", name)
+	}
+	groups = make(map[string]*Group)
+	groupsMu.Unlock()
+	for _, g := range all {
+		g.Close()
 	}
 }

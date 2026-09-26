@@ -66,8 +66,13 @@ func (p *ClientPicker) PrintPeers() {
 // NewClientPicker 创建新的ClientPicker实例
 func NewClientPicker(addr string, opts ...PickerOption) (*ClientPicker, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	selfAddr, err := registry.NormalizeAddr(addr)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	picker := &ClientPicker{
-		selfAddr: addr,
+		selfAddr: selfAddr,
 		svcName:  defaultSvcName,
 		clients:  make(map[string]*Client),
 		consHash: consistenthash.New(),
@@ -101,6 +106,14 @@ func NewClientPicker(addr string, opts ...PickerOption) (*ClientPicker, error) {
 
 // startServiceDiscovery 启动服务发现
 func (p *ClientPicker) startServiceDiscovery() error {
+	// The local node is an owner even though it has no client connection to itself.
+	p.mu.Lock()
+	if err := p.consHash.Add(p.selfAddr); err != nil {
+		p.mu.Unlock()
+		return err
+	}
+	p.mu.Unlock()
+
 	// 先进行全量更新
 	if err := p.fetchAllServices(); err != nil {
 		return err
@@ -121,7 +134,14 @@ func (p *ClientPicker) watchServiceChanges() {
 		case <-p.ctx.Done():
 			watcher.Close()
 			return
-		case resp := <-watchChan:
+		case resp, ok := <-watchChan:
+			if !ok {
+				return
+			}
+			if resp.Err() != nil {
+				logrus.Warnf("service discovery watch failed: %v", resp.Err())
+				continue
+			}
 			p.handleWatchEvents(resp.Events)
 		}
 	}
@@ -134,6 +154,12 @@ func (p *ClientPicker) handleWatchEvents(events []*clientv3.Event) {
 
 	for _, event := range events {
 		addr := string(event.Kv.Value)
+		if event.Type == clientv3.EventTypeDelete {
+			addr = parseAddrFromKey(string(event.Kv.Key), p.svcName)
+		}
+		if normalized, err := registry.NormalizeAddr(addr); err == nil {
+			addr = normalized
+		}
 		if addr == p.selfAddr {
 			continue
 		}
@@ -169,6 +195,9 @@ func (p *ClientPicker) fetchAllServices() error {
 
 	for _, kv := range resp.Kvs {
 		addr := string(kv.Value)
+		if normalized, err := registry.NormalizeAddr(addr); err == nil {
+			addr = normalized
+		}
 		if addr != "" && addr != p.selfAddr {
 			p.set(addr)
 			logrus.Infof("Discovered service at %s", addr)
@@ -179,6 +208,9 @@ func (p *ClientPicker) fetchAllServices() error {
 
 // set 添加服务实例
 func (p *ClientPicker) set(addr string) {
+	if addr == p.selfAddr {
+		return
+	}
 	if client, err := NewClient(addr, p.svcName, p.etcdCli); err == nil {
 		p.consHash.Add(addr)
 		p.clients[addr] = client
@@ -200,8 +232,11 @@ func (p *ClientPicker) PickPeer(key string) (Peer, bool, bool) {
 	defer p.mu.RUnlock()
 
 	if addr := p.consHash.Get(key); addr != "" {
+		if addr == p.selfAddr {
+			return nil, true, true
+		}
 		if client, ok := p.clients[addr]; ok {
-			return client, true, addr == p.selfAddr
+			return client, true, false
 		}
 	}
 	return nil, false, false
@@ -210,6 +245,7 @@ func (p *ClientPicker) PickPeer(key string) (Peer, bool, bool) {
 // Close 关闭所有资源
 func (p *ClientPicker) Close() error {
 	p.cancel()
+	p.consHash.Close()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 

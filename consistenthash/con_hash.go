@@ -25,6 +25,8 @@ type Map struct {
 	nodeCounts map[string]int64
 	// 总请求数
 	totalRequests int64
+	stopCh        chan struct{}
+	closeOnce     sync.Once
 }
 
 // New 创建一致性哈希实例
@@ -34,6 +36,7 @@ func New(opts ...Option) *Map {
 		hashMap:      make(map[int]string),
 		nodeReplicas: make(map[string]int),
 		nodeCounts:   make(map[string]int64),
+		stopCh:       make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -114,8 +117,9 @@ func (m *Map) Get(key string) string {
 		return ""
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	// Lookups update per-node load counters, so this must be an exclusive lock.
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	if len(m.keys) == 0 {
 		return ""
@@ -176,6 +180,12 @@ func (m *Map) addNode(node string, replicas int) {
 
 // checkAndRebalance 检查并重新平衡虚拟节点
 func (m *Map) checkAndRebalance() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checkAndRebalanceLocked()
+}
+
+func (m *Map) checkAndRebalanceLocked() {
 	if atomic.LoadInt64(&m.totalRequests) < 1000 {
 		return // 样本太少，不进行调整
 	}
@@ -193,7 +203,7 @@ func (m *Map) checkAndRebalance() {
 
 	// 如果负载不均衡度超过阈值，调整虚拟节点
 	if maxDiff > m.config.LoadBalanceThreshold {
-		m.rebalanceNodes()
+		m.rebalanceNodesLocked()
 	}
 }
 
@@ -201,12 +211,26 @@ func (m *Map) checkAndRebalance() {
 func (m *Map) rebalanceNodes() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.rebalanceNodesLocked()
+}
 
+func (m *Map) rebalanceNodesLocked() {
+	if len(m.nodeReplicas) == 0 {
+		return
+	}
 	avgLoad := float64(m.totalRequests) / float64(len(m.nodeReplicas))
 
 	// 调整每个节点的虚拟节点数量
-	for node, count := range m.nodeCounts {
+	nodes := make([]string, 0, len(m.nodeCounts))
+	for node := range m.nodeCounts {
+		nodes = append(nodes, node)
+	}
+	for _, node := range nodes {
+		count := m.nodeCounts[node]
 		currentReplicas := m.nodeReplicas[node]
+		if currentReplicas == 0 {
+			continue
+		}
 		loadRatio := float64(count) / avgLoad
 
 		var newReplicas int
@@ -227,10 +251,8 @@ func (m *Map) rebalanceNodes() {
 		}
 
 		if newReplicas != currentReplicas {
-			// 重新添加节点的虚拟节点
-			if err := m.Remove(node); err != nil {
-				continue // 如果移除失败，跳过这个节点
-			}
+			// Remove inline: rebalanceNodesLocked already owns m.mu.
+			m.removeNodeLocked(node)
 			m.addNode(node, newReplicas)
 		}
 	}
@@ -243,6 +265,23 @@ func (m *Map) rebalanceNodes() {
 
 	// 重新排序
 	sort.Ints(m.keys)
+}
+
+func (m *Map) removeNodeLocked(node string) {
+	replicas := m.nodeReplicas[node]
+	if replicas == 0 {
+		return
+	}
+	for i := 0; i < replicas; i++ {
+		hash := int(m.config.HashFunc([]byte(fmt.Sprintf("%s-%d", node, i))))
+		delete(m.hashMap, hash)
+		idx := sort.SearchInts(m.keys, hash)
+		if idx < len(m.keys) && m.keys[idx] == hash {
+			m.keys = append(m.keys[:idx], m.keys[idx+1:]...)
+		}
+	}
+	delete(m.nodeReplicas, node)
+	delete(m.nodeCounts, node)
 }
 
 // GetStats 获取负载统计信息
@@ -268,8 +307,18 @@ func (m *Map) startBalancer() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			m.checkAndRebalance()
+		for {
+			select {
+			case <-ticker.C:
+				m.checkAndRebalance()
+			case <-m.stopCh:
+				return
+			}
 		}
 	}()
+}
+
+// Close stops the background balancer. It is safe to call repeatedly.
+func (m *Map) Close() {
+	m.closeOnce.Do(func() { close(m.stopCh) })
 }
