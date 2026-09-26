@@ -63,7 +63,10 @@ func (c *Cache) ensureInitialized() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.initialized == 0 {
+	if atomic.LoadInt32(&c.closed) == 1 || atomic.LoadInt32(&c.initialized) == 1 {
+		return
+	}
+	if atomic.LoadInt32(&c.initialized) == 0 {
 		// 创建存储选项
 		storeOpts := store.Options{
 			MaxBytes:        c.opts.MaxBytes,
@@ -92,6 +95,11 @@ func (c *Cache) Add(key string, value ByteView) {
 	}
 
 	c.ensureInitialized()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed == 1 || c.store == nil {
+		return
+	}
 
 	if err := c.store.Set(key, value); err != nil {
 		logrus.Warnf("Failed to add key %s to cache: %v", key, err)
@@ -112,6 +120,10 @@ func (c *Cache) Get(ctx context.Context, key string) (value ByteView, ok bool) {
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.closed == 1 || c.initialized == 0 || c.store == nil {
+		atomic.AddInt64(&c.misses, 1)
+		return ByteView{}, false
+	}
 
 	// 从底层存储获取
 	val, found := c.store.Get(key)
@@ -142,6 +154,11 @@ func (c *Cache) AddWithExpiration(key string, value ByteView, expirationTime tim
 	}
 
 	c.ensureInitialized()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed == 1 || c.store == nil {
+		return
+	}
 
 	// 计算过期时间
 	expiration := time.Until(expirationTime)
@@ -164,6 +181,9 @@ func (c *Cache) Delete(key string) bool {
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.closed == 1 || c.initialized == 0 || c.store == nil {
+		return false
+	}
 
 	return c.store.Delete(key)
 }
@@ -176,6 +196,9 @@ func (c *Cache) Clear() {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed == 1 || c.initialized == 0 || c.store == nil {
+		return
+	}
 
 	c.store.Clear()
 
@@ -192,6 +215,9 @@ func (c *Cache) Len() int {
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.closed == 1 || c.initialized == 0 || c.store == nil {
+		return 0
+	}
 
 	return c.store.Len()
 }

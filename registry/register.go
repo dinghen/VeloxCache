@@ -24,21 +24,23 @@ var DefaultConfig = &Config{
 
 // Register 注册服务到etcd
 func Register(svcName, addr string, stopCh <-chan error) error {
+	return RegisterWithConfig(svcName, addr, stopCh, *DefaultConfig)
+}
+
+// RegisterWithConfig registers a service using an instance-specific etcd configuration.
+func RegisterWithConfig(svcName, addr string, stopCh <-chan error, config Config) error {
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   DefaultConfig.Endpoints,
-		DialTimeout: DefaultConfig.DialTimeout,
+		Endpoints:   append([]string(nil), config.Endpoints...),
+		DialTimeout: config.DialTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create etcd client: %v", err)
 	}
 
-	localIP, err := getLocalIP()
+	addr, err = NormalizeAddr(addr)
 	if err != nil {
 		cli.Close()
-		return fmt.Errorf("failed to get local IP: %v", err)
-	}
-	if addr[0] == ':' {
-		addr = fmt.Sprintf("%s%s", localIP, addr)
+		return fmt.Errorf("failed to normalize service address: %w", err)
 	}
 
 	// 创建租约
@@ -86,6 +88,21 @@ func Register(svcName, addr string, stopCh <-chan error) error {
 
 	logrus.Infof("Service registered: %s at %s", svcName, addr)
 	return nil
+}
+
+// NormalizeAddr returns the address form used in the registry and hash ring.
+func NormalizeAddr(addr string) (string, error) {
+	if addr == "" {
+		return "", fmt.Errorf("empty address")
+	}
+	if addr[0] != ':' {
+		return addr, nil
+	}
+	ip, err := getLocalIP()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s%s", ip, addr), nil
 }
 
 func getLocalIP() (string, error) {

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +11,8 @@ type lru2Store struct {
 	caches      [][2]*cache
 	onEvicted   func(key string, value Value)
 	cleanupTick *time.Ticker
+	closeCh     chan struct{}
+	closeOnce   sync.Once
 	mask        int32
 }
 
@@ -35,6 +36,7 @@ func newLRU2Cache(opts Options) *lru2Store {
 		caches:      make([][2]*cache, mask+1),
 		onEvicted:   opts.OnEvicted,
 		cleanupTick: time.NewTicker(opts.CleanupInterval),
+		closeCh:     make(chan struct{}),
 		mask:        int32(mask),
 	}
 
@@ -64,13 +66,11 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 		if expireAt > 0 && currentTime >= expireAt {
 			// 项目已过期，删除它
 			s.delete(key, idx)
-			fmt.Println("找到项目已过期，删除它")
 			return nil, false
 		}
 
 		// 项目有效，将其移至二级缓存
 		s.caches[idx][1].put(key, n1.v, expireAt, s.onEvicted)
-		fmt.Println("项目有效，将其移至二级缓存")
 		return n1.v, true
 	}
 
@@ -80,7 +80,6 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 		if n2.expireAt > 0 && currentTime >= n2.expireAt {
 			// 项目已过期，删除它
 			s.delete(key, idx)
-			fmt.Println("找到项目已过期，删除它")
 			return nil, false
 		}
 
@@ -91,12 +90,17 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 }
 
 func (s *lru2Store) Set(key string, value Value) error {
-	return s.SetWithExpiration(key, value, 9999999999999999)
+	return s.SetWithExpiration(key, value, 0)
 }
 
 func (s *lru2Store) SetWithExpiration(key string, value Value, expiration time.Duration) error {
+	if value == nil {
+		s.Delete(key)
+		return nil
+	}
 	// 计算过期时间 - 确保单位一致
-	expireAt := int64(0)
+	// Zero means no expiration; zero is reserved internally for deleted nodes.
+	expireAt := int64(-1)
 	if expiration > 0 {
 		// now() 返回纳秒时间戳，确保 expiration 也是纳秒单位
 		expireAt = Now() + int64(expiration.Nanoseconds())
@@ -106,8 +110,20 @@ func (s *lru2Store) SetWithExpiration(key string, value Value, expiration time.D
 	s.locks[idx].Lock()
 	defer s.locks[idx].Unlock()
 
-	// 放入一级缓存
-	s.caches[idx][0].put(key, value, expireAt, s.onEvicted)
+	// A key can be logically present in level two after a previous promotion.
+	// Mark that entry dead before inserting the fresh level-one value.
+	s.caches[idx][1].del(key)
+	if _, exists := s.caches[idx][0].hmap[key]; !exists && s.caches[idx][0].last == uint16(cap(s.caches[idx][0].m)) {
+		tailIndex := s.caches[idx][0].dlnk[0][p]
+		if tailIndex != 0 {
+			tail := s.caches[idx][0].m[tailIndex-1]
+			if tail.expireAt != 0 {
+				s.caches[idx][1].put(tail.k, tail.v, tail.expireAt, s.onEvicted)
+			}
+		}
+	}
+	// Level-one eviction is a promotion, not a final eviction.
+	s.caches[idx][0].put(key, value, expireAt, nil)
 
 	return nil
 }
@@ -177,9 +193,12 @@ func (s *lru2Store) Len() int {
 
 // Close 关闭缓存相关资源
 func (s *lru2Store) Close() {
-	if s.cleanupTick != nil {
-		s.cleanupTick.Stop()
-	}
+	s.closeOnce.Do(func() {
+		if s.cleanupTick != nil {
+			s.cleanupTick.Stop()
+		}
+		close(s.closeCh)
+	})
 }
 
 // 内部时钟，减少 time.Now() 调用造成的 GC 压力
@@ -258,7 +277,7 @@ func (c *cache) put(key string, val Value, expireAt int64, onEvicted func(string
 
 	if c.last == uint16(cap(c.m)) {
 		tail := &c.m[c.dlnk[0][p]-1]
-		if onEvicted != nil && (*tail).expireAt > 0 {
+		if onEvicted != nil && (*tail).expireAt != 0 {
 			onEvicted((*tail).k, (*tail).v)
 		}
 
@@ -298,7 +317,7 @@ func (c *cache) get(key string) (*node, int) {
 
 // 从缓存中删除键对应的项
 func (c *cache) del(key string) (*node, int, int64) {
-	if idx, ok := c.hmap[key]; ok && c.m[idx-1].expireAt > 0 {
+	if idx, ok := c.hmap[key]; ok && c.m[idx-1].expireAt != 0 {
 		e := c.m[idx-1].expireAt
 		c.m[idx-1].expireAt = 0 // 标记为已删除
 		c.adjust(idx, n, p)     // 移动到链表尾部
@@ -311,7 +330,7 @@ func (c *cache) del(key string) (*node, int, int64) {
 // 遍历缓存中的所有有效项
 func (c *cache) walk(walker func(key string, value Value, expireAt int64) bool) {
 	for idx := c.dlnk[0][n]; idx != 0; idx = c.dlnk[idx][n] {
-		if c.m[idx-1].expireAt > 0 && !walker(c.m[idx-1].k, c.m[idx-1].v, c.m[idx-1].expireAt) {
+		if c.m[idx-1].expireAt != 0 && !walker(c.m[idx-1].k, c.m[idx-1].v, c.m[idx-1].expireAt) {
 			return
 		}
 	}
@@ -333,7 +352,7 @@ func (c *cache) adjust(idx, f, t uint16) {
 func (s *lru2Store) _get(key string, idx, level int32) (*node, int) {
 	if n, st := s.caches[idx][level].get(key); st > 0 && n != nil {
 		currentTime := Now()
-		if n.expireAt <= 0 || currentTime >= n.expireAt {
+		if n.expireAt == 0 || (n.expireAt > 0 && currentTime >= n.expireAt) {
 			// 过期或已删除
 			return nil, 0
 		}
@@ -364,40 +383,45 @@ func (s *lru2Store) delete(key string, idx int32) bool {
 }
 
 func (s *lru2Store) cleanupLoop() {
-	for range s.cleanupTick.C {
-		currentTime := Now()
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-s.cleanupTick.C:
+			currentTime := Now()
 
-		for i := range s.caches {
-			s.locks[i].Lock()
+			for i := range s.caches {
+				s.locks[i].Lock()
 
-			// 检查并清理过期项目
-			var expiredKeys []string
+				// 检查并清理过期项目
+				var expiredKeys []string
 
-			s.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
-				if expireAt > 0 && currentTime >= expireAt {
-					expiredKeys = append(expiredKeys, key)
-				}
-				return true
-			})
-
-			s.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
-				if expireAt > 0 && currentTime >= expireAt {
-					for _, k := range expiredKeys {
-						if key == k {
-							// 避免重复
-							return true
-						}
+				s.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
+					if expireAt > 0 && currentTime >= expireAt {
+						expiredKeys = append(expiredKeys, key)
 					}
-					expiredKeys = append(expiredKeys, key)
+					return true
+				})
+
+				s.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
+					if expireAt > 0 && currentTime >= expireAt {
+						for _, k := range expiredKeys {
+							if key == k {
+								// 避免重复
+								return true
+							}
+						}
+						expiredKeys = append(expiredKeys, key)
+					}
+					return true
+				})
+
+				for _, key := range expiredKeys {
+					s.delete(key, int32(i))
 				}
-				return true
-			})
 
-			for _, key := range expiredKeys {
-				s.delete(key, int32(i))
+				s.locks[i].Unlock()
 			}
-
-			s.locks[i].Unlock()
 		}
 	}
 }
