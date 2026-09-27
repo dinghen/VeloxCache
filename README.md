@@ -1,134 +1,166 @@
-
 # VeloxCache
 
-**本项目目前只在[知识星球](https://programmercarl.com/other/kstar.html)里维护，并答疑**
+VeloxCache 是一个使用 Go 编写的内存分布式缓存服务。本仓库基于已有开源项目，由我主导完成二次开发和维护，重点放在单 owner 路由、缓存生命周期、并发安全和节点间通信的可靠性上。
 
-分布式缓存（Go）这个项目在 23年就在星球里发布了。
+## 项目来源
 
-如今，对这个项目做了第二版优化。
+| 项目 | 地址 | 说明 |
+| --- | --- | --- |
+| 原项目 | [github.com/youngyangyang04/VeloxCache](https://github.com/youngyangyang04/VeloxCache) | 提供缓存组、LRU/LRU2、singleflight、gRPC 和 etcd 服务发现等基础实现 |
+| 当前仓库 | [github.com/dinghen/VeloxCache](https://github.com/dinghen/VeloxCache) | 由我主导进行二次开发、问题修复和测试补充 |
 
-对代码讲解，面试问题，和简历写法，都做了补充和完善。
+项目的 Go module 路径仍保持为 `github.com/youngyangyang04/VeloxCache`，以兼容原项目的代码和依赖；仓库地址与 module 路径不同是有意保留的兼容性安排。
 
-本项目今天在[知识星球](https://programmercarl.com/other/kstar.html)里正式发布：
+## 二次开发内容
 
-![image](https://file1.kamacoder.com/i/web/20250414102441.png)
+本次二次开发主要完成了以下工作：
 
-## 什么是缓存
+- 采用一致性哈希实现单 owner 路由：每个 key 在同一时刻只由一个节点负责。
+- 统一 `Get`、`Set`、`Delete` 的路由行为：owner 节点在本地执行，非 owner 节点通过 gRPC 转发请求。
+- 移除异步副本同步路径，避免重复写入、请求循环和节点间状态不明确的问题。
+- 规范化节点地址，并正确识别本节点，避免 `:port`、本机 IP 和注册中心地址不一致导致的错误路由。
+- 修复 singleflight 的并发竞态，确保同一个 key 只执行一次回源；回源函数 panic 时也能释放等待者并清理状态。
+- 修复一致性哈希的并发访问、重平衡和后台 goroutine 生命周期问题。
+- 修复 Cache、LRU 和 LRU2 在 TTL、淘汰、清空、关闭及并发访问场景下的生命周期问题。
+- 修复 Group、Server 和 etcd 注册流程的停止逻辑、资源释放和配置隔离问题。
+- 增加单元测试、并发测试、竞态测试和双节点 owner 路由测试，覆盖缓存及分布式请求的关键行为。
 
-缓存是将高频访问的数据暂存到内存中，是加速数据访问的存储，降低延迟，提高吞吐率的利器。
+## 当前架构
 
-## 为什么要实现缓存系统
+```text
+应用请求
+   |
+   v
+Group                 缓存组、请求编排、owner 路由
+   |
+   +--> Cache          懒初始化、TTL 转换、缓存统计
+   |       |
+   |       +--> store  LRU / LRU2 内存存储和淘汰
+   |
+   +--> singleflight  合并相同 key 的并发回源
+   |
+   +--> PeerPicker     一致性哈希选择 owner
+           |
+           +--> gRPC Client/Server  节点间 Get/Set/Delete
+           +--> etcd registry        节点注册与服务发现
+```
 
-因缓存的使用相关需求，通过牺牲一部分服务器内存，减少对磁盘或者数据库资源进行直接读写，可换取更快响应速度。
+主要目录和职责：
 
-尤其是处理高并发的场景，负责存储经常访问的数据，通过设计合理的缓存机制提高资源的访问效率。
+| 目录或文件 | 职责 |
+| --- | --- |
+| `group.go` | 缓存组、请求入口、单 owner 路由和统计 |
+| `cache.go` | 缓存生命周期、懒初始化、TTL 和统计封装 |
+| `store/` | LRU、LRU2 及底层存储接口 |
+| `consistenthash/` | 一致性哈希环和节点重平衡 |
+| `singleflight/` | 合并相同 key 的并发加载请求 |
+| `client.go`、`server.go`、`peers.go` | gRPC 节点通信和 peer 选择 |
+| `registry/` | etcd 注册、租约续期和注销 |
+| `pb/` | protobuf 消息及 gRPC 代码 |
 
-由于服务器的内存是有限的，我们不能把所有数据都存放在内存中，因此需要一种机制来决定当使用内存超过一定标准时，应该删除哪些数据，这就涉及到缓存淘汰策略的选择。
+## 分布式语义和边界
 
-## 在什么地方加缓存
+- 每个 key 由一致性哈希环选出一个 owner。
+- owner 节点直接访问自己的本地缓存和数据源。
+- 非 owner 节点将请求转发给 owner，避免多个节点同时写入同一个 key。
+- 节点加入或离开时，一致性哈希环会重新平衡；当前实现不会自动迁移或复制已有缓存数据。
+- 当前实现是内存缓存，不提供持久化存储。
+- 当前实现不提供多副本复制、故障转移或跨节点数据恢复；owner 节点不可用时，请求会返回错误。
+- etcd 只负责节点注册和服务发现，不保存缓存数据。
 
-距离用户越近，缓存能够发挥的效果越好。
+## 已支持的能力
 
-缓存的顺序：用户请求->HTTP缓存->CDN缓存->代理服务器缓存->进程内缓存->分布式缓存->数据库
+- Go 内存缓存
+- LRU 和 LRU2 淘汰策略（默认使用 LRU2）
+- TTL 过期和后台清理
+- singleflight 并发回源合并
+- 一致性哈希单 owner 路由
+- gRPC 节点间访问
+- etcd 服务注册与发现
+- 缓存命中、未命中、回源和 peer 访问统计
 
-根据 缓存的存储方式 和 应用的耦合度，缓存可以分为 本地缓存（Local Cache） 和 分布式缓存（Distributed Cache）。
-
-本地缓存更注重 访问速度，而分布式缓存则关注 数据一致性和扩展性。
-
-## 分布式缓存（Distributed Cache）
-
-分布式缓存是一种 独立部署的缓存服务，与应用进程分离，多个应用实例共享同一份缓存数据，典型实现包括 Redis、Memcached、etcd。
-
-优势
-
-1、支持大规模存储：
-
-  * 缓存数据分布在多个服务器上，不受单机内存限制，可扩展存储空间。
-  * 例如：Redis Cluster 支持横向扩展，通过分片技术存储 TB 级数据。
-
-2、数据一致性更高：
-  * 由于所有应用节点共享同一份缓存数据，不同服务器间的缓存一致性更容易保证。
-  * 例如：所有服务器都访问 Redis，数据变更时只需更新 Redis 即可同步到所有应用实例。
-
-3、高可用性：
-
-* Redis Sentinel 或 主从复制 方案可提供 缓存高可用性，即使某个缓存节点宕机，仍可快速切换到备用节点，避免单点故障。
-* 持久化机制（AOF/RDB） 使 Redis 在服务器重启后仍能恢复数据，保证缓存数据不会丢失。
-
-4、适用于分布式系统：
-* 现代应用通常采用 多实例部署（如 Kubernetes 微服务架构），本地缓存难以满足数据共享需求，而 分布式缓存天然适用于多实例环境。
-
-
-## 项目专栏精讲
-
-该项目的专栏是[知识星球](https://programmercarl.com/other/kstar.html)录友专享的。
-
-项目专栏依然是将 「简历写法」给大家列出来了，大家学完就可以参考这个来写简历：
-
-![image](https://file1.kamacoder.com/i/web/20250414101516.png)
-
-做完该项目，面试中大概率会有哪些面试问题，以及如何回答，也列出好了：
-
-![image](https://file1.kamacoder.com/i/web/20250414101617.png)
-
-专栏中的项目面试题都掌握的话，这个项目在面试中基本没问题。
-
-项目架构：
-
-![image](https://file1.kamacoder.com/i/web/20250414101706.png)
-
-本项目主要模块：缓存组、缓存淘汰与实现、缓存并发、分布式算法之一致性哈希、缓存对外服务化 都做了详细的讲解：
-
-![image](https://file1.kamacoder.com/i/web/20250414101827.png)
-
-![image](https://file1.kamacoder.com/i/web/20250414101856.png)
-
-![image](https://file1.kamacoder.com/i/web/20250414101913.png)
-
-![image](https://file1.kamacoder.com/i/web/20250414101930.png)
-
-
-## 获取本项目专栏
-
-**本文档仅为星球内部专享，大家可以加入[知识星球](https://programmercarl.com/other/kstar.html)里获取，在星球置顶一**
-
-
-## 许可证
-
-MIT License
-
-## 本地配置与运行
+## 快速开始
 
 ### 环境要求
 
-- Go 1.22 或更高版本（项目的 `go.mod` 使用 Go 1.22.11 toolchain）
-- etcd 3.5，默认监听 `localhost:2379`
-- Docker Compose（仅在使用仓库提供的 etcd 配置时需要）
+- Go 1.22 或更高版本
+- etcd 3.5
+- Docker Compose（仅在使用仓库提供的 etcd 容器时需要）
 
-项目提供了 `docker-compose.yml`，可直接启动本地 etcd：
+### 启动 etcd
+
+```bash
+make etcd-up
+```
+
+也可以直接执行：
 
 ```bash
 docker compose up -d etcd
 ```
 
-依赖下载、测试和示例运行命令已集中到 `Makefile`。该 Makefile 默认将 Go 缓存放在 `/tmp/veloxcache-go`，适用于无法写入系统 Go 缓存目录的环境：
+默认 etcd 地址为 `localhost:2379`。
+默认服务名为 `velox-cache`。
 
-```bash
-make setup       # 下载依赖
-make test        # 运行全部测试
-make vet         # 执行 go vet
-make run-example # 启动示例节点，默认端口 8001
-```
+### 运行示例节点
 
-示例节点需要先启动 etcd。要启动多个节点，可分别指定端口和节点标识：
+在两个终端分别启动两个缓存节点：
 
 ```bash
 make run-example PORT=8001 NODE=A
 make run-example PORT=8002 NODE=B
 ```
 
-默认 etcd 地址和服务名在代码中分别为 `localhost:2379` 和 `velox-cache`。如果不使用 Docker，请自行提供兼容的 etcd 3.5 服务，并确保该地址可访问。
+示例程序会创建缓存组、注册节点、写入本节点数据，并演示本地 owner 和远程 owner 的读取流程。单节点运行时也可以执行：
 
-### 验证备注
+```bash
+make run-example
+```
 
-在当前仓库版本中，`make vet` 可以通过；`make test` 会命中 `store/lru2_test.go` 中已有的 `TestLRU2StoreLRUEviction` 和 `TestLRU2StoreHitRatio` 失败。这两个失败来自上游现有的 LRU2 实现/测试行为，配置文件没有修改相关源码。
+### 在代码中使用
+
+下面是核心调用片段，其中 `loadFromSource` 需要替换为实际的数据源加载逻辑：
+
+```go
+group := veloxcache.NewGroup(
+    "users",
+    8<<20,
+    veloxcache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+        return loadFromSource(ctx, key)
+    }),
+)
+
+value, err := group.Get(ctx, "user:1")
+```
+
+分布式部署时，为 `Group` 注册 `PeerPicker`，并使用 `Server` 和 `ClientPicker` 接入 gRPC 与 etcd 服务发现。可参考 [`example/test.go`](example/test.go)。
+
+## 测试和质量检查
+
+```bash
+make setup
+make test
+make vet
+```
+
+需要检查并发竞态时执行：
+
+```bash
+go test -race ./...
+```
+
+项目的核心验证还包括重复运行测试：
+
+```bash
+go test ./... -count=3
+```
+
+停止本地 etcd：
+
+```bash
+make etcd-down
+```
+
+## 许可证
+
+本项目使用 [MIT License](LICENSE)。
